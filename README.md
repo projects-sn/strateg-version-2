@@ -1,0 +1,1 @@
+# strateg-version-2
