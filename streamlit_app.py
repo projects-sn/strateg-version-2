@@ -293,11 +293,11 @@ with st.sidebar:
         "внутренних документов, анализа конкурентов и прогнозных сценариев."
     )
     st.markdown("### Блоки анализа")
-    st.markdown("**❌ Наш прошлый опыт**")
+    st.markdown("**🟥 Наш прошлый опыт**")
     st.write("Внутренняя аналитика: документы, стенограммы, брифинги.")
-    st.markdown("**❌ Анализ конкурентов**")
+    st.markdown("**🟥 Анализ конкурентов**")
     st.write("Внешние кейсы других вузов РФ и СНГ.")
-    st.markdown("**❌ Предложения и гипотезы**")
+    st.markdown("**🟥 Предложения и гипотезы**")
     st.write("Идеи и варианты развития на 1–3 года.")
 
 # Инициализация session_id для websearch и других агентов
@@ -321,12 +321,12 @@ if "final_unavailable" not in st.session_state:
     st.session_state["final_unavailable"] = False
 
 # Опрос фоновых агентов (Websearch, Future) — результат выводится по готовности
+# Примечание: final_strategy теперь выполняется синхронно, не опрашиваем
 def _poll_pending_agents():
     rerun_needed = False
     for key, result_key, unavailable_key, timeout in [
         ("_pending_websearch_future", "websearch_result", "websearch_unavailable", WEBSEARCH_TIMEOUT),
         ("_pending_future_future", "future_result", "future_unavailable", FUTURE_AGENT_TIMEOUT),
-        ("_pending_final_future", "final_strategy_result", "final_unavailable", FINAL_STRATEGY_TIMEOUT),
     ]:
         fut = st.session_state.get(key)
         if fut is None:
@@ -367,45 +367,7 @@ def _poll_pending_agents():
 
 _poll_rerun = _poll_pending_agents()
 
-# Если все 3 результата есть, но итоговые стратегии ещё не считали — запускаем в фоне (чтобы UI не блокировался).
-def _maybe_start_final_strategy():
-    if st.session_state.get("final_strategy_result") is not None:
-        return False
-    if st.session_state.get("_pending_final_future") is not None:
-        return False
-    rag_summary = st.session_state.get("last_answer", "")
-    web_result = st.session_state.get("websearch_result")
-    future_result = st.session_state.get("future_result")
-    if not (rag_summary and web_result and future_result):
-        return False
-
-    # Пытаемся вытащить summary/bullets из raw
-    raw_web = getattr(web_result, "raw", {}) or {}
-    web_summary = raw_web.get("summary", "") if isinstance(raw_web, dict) else ""
-    web_bullets = raw_web.get("bullets", []) if isinstance(raw_web, dict) else []
-    if not isinstance(web_bullets, list):
-        web_bullets = []
-
-    # executor: переиспользуем общий, если есть
-    ex = st.session_state.get("_agent_executor")
-    if ex is None:
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        st.session_state["_agent_executor"] = ex
-
-    st.session_state["final_unavailable"] = False
-    f_final = ex.submit(
-        build_final_strategy,
-        rag_summary=rag_summary,
-        web_summary=web_summary,
-        web_bullets=web_bullets,
-        future_text=getattr(future_result, "answer_text", "") or "",
-    )
-    st.session_state["_pending_final_future"] = f_final
-    st.session_state["_pending_final_future_start"] = time.time()
-    return True
-
-if _maybe_start_final_strategy():
-    st.rerun()
+# Убрали фоновое выполнение - стратегии будут считаться синхронно при нажатии "Запустить советника"
 
 # ---- Глобальный ввод и обогащение запроса (для всех вкладок) ----
 query = st.text_input(
@@ -414,14 +376,19 @@ query = st.text_input(
     key="rag_query",
 )
 
-# Состояние: запрос уже обогащён для текущего ввода (тогда первая кнопка сереет, вторая становится основной)
+# Логика цветов кнопок: красной должна быть актуальная кнопка
 _current_q = (query or "").strip()
-_enrich_ready_for_current = bool(st.session_state.get("enriched_query")) and st.session_state.get("original_query") == _current_q
+_has_enriched = bool(st.session_state.get("enriched_query"))
+_original_matches = st.session_state.get("original_query") == _current_q
+_enrich_ready_for_current = _has_enriched and _original_matches
+
+# "Обработать запрос" красная, если запрос не обогащён (по умолчанию красная при первом заходе)
+_should_show_process_primary = not _enrich_ready_for_current
 
 launch_btn = st.button(
     "Обработать запрос",
     key="rag_launch",
-    type="primary" if (not _enrich_ready_for_current and bool(_current_q)) else "secondary",
+    type="primary" if _should_show_process_primary else "secondary",
 )
 
 if launch_btn and query:
@@ -436,6 +403,8 @@ if launch_btn and query:
         except Exception as e:
             st.error(f"Ошибка при обогащении запроса: {e}")
             st.session_state["enriched_query"] = query.strip()
+    # После обогащения делаем rerun, чтобы обновить цвета кнопок
+    st.rerun()
 
 if st.session_state.get("enriched_query") and st.session_state.get("original_query") == (query or "").strip():
     st.markdown("---")
@@ -452,70 +421,131 @@ if st.session_state.get("enriched_query") and st.session_state.get("original_que
     if edited_query_direct != st.session_state.get("enriched_query"):
         st.session_state["enriched_query"] = edited_query_direct
 
+    # "Запустить советника" красная, когда есть обогащенный запрос для текущего запроса
+    _should_show_launch_primary = _enrich_ready_for_current
     propose_btn = st.button(
         "Запустить советника",
-        type="primary" if _enrich_ready_for_current else "secondary",
+        type="primary" if _should_show_launch_primary else "secondary",
         key="propose_all_agents",
     )
     if propose_btn:
         st.session_state["enriched_query"] = edited_query_direct.strip()
         st.session_state["websearch_unavailable"] = False
         st.session_state["future_unavailable"] = False
+        st.session_state["final_strategy_result"] = None  # Сбрасываем предыдущие стратегии
         try:
             q = st.session_state["original_query"]
             eq = st.session_state["enriched_query"]
             sid_web = st.session_state["websearch_session_id"]
             sid_fut = st.session_state["future_session_id"]
 
-            with st.spinner("Начало анализа…"):
+            with st.spinner("Запуск всех агентов и формирование стратегий…"):
                 ex = concurrent.futures.ThreadPoolExecutor(max_workers=3)
                 f_rag = ex.submit(_run_rag_task, q, q, q)
                 f_web = ex.submit(web_search, session_id=sid_web, user_query=eq)
                 f_fut = ex.submit(future_chat, session_id=sid_fut, user_query=eq)
+                
+                # Ждём все 3 результата
                 t0 = time.perf_counter()
                 rag_result = f_rag.result(timeout=120)
-                log.info("RAG (direct): готов за %.2f s", time.perf_counter() - t0)
+                log.info("RAG: готов за %.2f s", time.perf_counter() - t0)
+                
+                t0 = time.perf_counter()
+                web_result = f_web.result(timeout=WEBSEARCH_TIMEOUT)
+                log.info("Websearch: готов за %.2f s", time.perf_counter() - t0)
+                
+                t0 = time.perf_counter()
+                future_result = f_fut.result(timeout=FUTURE_AGENT_TIMEOUT)
+                log.info("Future: готов за %.2f s", time.perf_counter() - t0)
 
             if rag_result and rag_result[3]:
                 st.error(f"Ошибка RAG: {rag_result[3]}")
             elif rag_result and rag_result[0]:
+                # Сохраняем RAG результаты в session_state
                 st.session_state["last_answer"] = rag_result[0]
                 st.session_state["last_docs"] = rag_result[1]
                 st.session_state["top_sources"] = rag_result[2]
+                log.info("RAG results saved: answer length=%d, docs=%d, sources=%d", 
+                        len(rag_result[0]) if rag_result[0] else 0,
+                        len(rag_result[1]) if rag_result[1] else 0,
+                        len(rag_result[2]) if rag_result[2] else 0)
             else:
                 st.info("По запросу ничего не найдено.")
+                # Очищаем старые данные, если ничего не найдено
+                st.session_state["last_answer"] = None
+                st.session_state["last_docs"] = None
+                st.session_state["top_sources"] = None
 
-            st.session_state["_pending_websearch_future"] = f_web
-            st.session_state["_pending_websearch_future_start"] = time.time()
-            st.session_state["_pending_future_future"] = f_fut
-            st.session_state["_pending_future_future_start"] = time.time()
-            st.session_state["_agent_executor"] = ex
+            st.session_state["websearch_result"] = web_result
+            st.session_state["future_result"] = future_result
+
+            # Формируем итоговые стратегии синхронно
+            if rag_result and rag_result[0] and web_result and future_result:
+                with st.spinner("Формируем итоговые стратегии…"):
+                    try:
+                        raw_web = getattr(web_result, "raw", {}) or {}
+                        web_summary = raw_web.get("summary", "") if isinstance(raw_web, dict) else ""
+                        web_bullets = raw_web.get("bullets", []) if isinstance(raw_web, dict) else []
+                        if not isinstance(web_bullets, list):
+                            web_bullets = []
+
+                        t0 = time.perf_counter()
+                        final_result = build_final_strategy(
+                            rag_summary=rag_result[0],
+                            web_summary=web_summary,
+                            web_bullets=web_bullets,
+                            future_text=getattr(future_result, "answer_text", "") or "",
+                        )
+                        log.info("Final-strategy agent: готов за %.2f s", time.perf_counter() - t0)
+                        # Сохраняем результат в session_state ПЕРЕД rerun
+                        st.session_state["final_strategy_result"] = final_result
+                        st.session_state["show_swot_map"] = {}
+                        log.info("Final strategy saved to session_state: %s", type(final_result))
+                    except Exception as e:
+                        st.error(f"Ошибка при формировании стратегий: {e}")
+                        log.warning("Final strategy failed: %s", e)
+                        import traceback
+                        log.warning("Traceback: %s", traceback.format_exc())
+
+            try:
+                ex.shutdown(wait=False)
+            except Exception:
+                pass
             st.rerun()
         except Exception as e:
             st.error(f"Ошибка: {e}")
+            log.warning("Agent execution failed: %s", e)
 
 # ---- Итоговые стратегии и SWOT на главной ----
-if st.session_state.get("final_strategy_result"):
-    result = st.session_state["final_strategy_result"]
+# Стратегии выводятся ПЕРВЫМИ, перед вкладками
+final_strategy = st.session_state.get("final_strategy_result")
+if final_strategy:
+    result = final_strategy
     import re
 
     text = result.main_text or ""
     swot_all = result.swot_text or ""
-
-    blocks = re.split(r"\n(?=###\s*Стратегия\s*\d+:)", text)
-    header = blocks[0].strip() if blocks else ""
-    lines = header.splitlines()
-    keep = []
-    for line in lines:
-        s = line.strip()
-        if s.startswith("Ранжирование") or s.startswith("1\ufe0f\u20e3") or s.startswith("2\ufe0f\u20e3") or s.startswith("3\ufe0f\u20e3"):
-            break
-        keep.append(line)
-    header = "\n".join(keep).strip()
+    
+    log.info("Final strategy found: text length=%d, swot length=%d", len(text), len(swot_all))
+    
+    # Всегда показываем заголовок, если есть стратегии
     st.markdown("---")
     st.subheader("Итоговые отранжированные стратегии")
-    if header:
-        st.markdown(header)
+    
+    # Выводим стратегии всегда, если они есть
+    if text:
+        blocks = re.split(r"\n(?=###\s*Стратегия\s*\d+:)", text)
+        header = blocks[0].strip() if blocks else ""
+        lines = header.splitlines()
+        keep = []
+        for line in lines:
+            s = line.strip()
+            if s.startswith("Ранжирование") or s.startswith("1\ufe0f\u20e3") or s.startswith("2\ufe0f\u20e3") or s.startswith("3\ufe0f\u20e3"):
+                break
+            keep.append(line)
+        header = "\n".join(keep).strip()
+        if header:
+            st.markdown(header)
 
     swot_by_idx: dict[int, dict[str, list[str]]] = {}
     if swot_all:
@@ -636,104 +666,91 @@ if st.session_state.get("final_strategy_result"):
         """
         st.markdown(html, unsafe_allow_html=True)
 
-    blocks_main = blocks[1:] if len(blocks) > 1 else []
-    strategy_blocks = []
-    for i, b in enumerate(blocks_main, 1):
-        b = b.strip()
-        if not b or not re.match(r"^###\s*Стратегия\s*\d+:", b):
-            continue
-        opt = _extract_scores(b).get("Оптимальность", "0")
-        try:
-            opt_int = int(opt)
-        except ValueError:
-            opt_int = 0
-        strategy_blocks.append((opt_int, i, b))
-
-    strategy_blocks.sort(key=lambda x: (-x[0], x[1]))
-    cup_chars = ("\U0001f947", "\U0001f948", "\U0001f949")
-
-    def _drop_ranking_block(text: str) -> str:
-        lines = text.splitlines()
-        keep = []
-        for line in lines:
-            s = line.strip()
-            if s.startswith("Ранжирование") or s.startswith("1\ufe0f\u20e3") or s.startswith("2\ufe0f\u20e3") or s.startswith("3\ufe0f\u20e3"):
-                break
-            keep.append(line)
-        return "\n".join(keep).strip()
-
-    def _drop_scores_and_rules(text: str) -> str:
-        """Убирает строку с оценками (Оценки 0-10: ...) и горизонтальные разделители (---)."""
-        lines = text.splitlines()
-        keep = []
-        for line in lines:
-            s = line.strip()
-            if "Оценки" in s and ("Затратность" in s or "Оптимальность" in s or re.search(r"\d+\s*;\s*\d+", s)):
+    # Обрабатываем блоки стратегий только если есть текст
+    if text:
+        blocks_main = blocks[1:] if len(blocks) > 1 else []
+        strategy_blocks = []
+        for i, b in enumerate(blocks_main, 1):
+            b = b.strip()
+            if not b or not re.match(r"^###\s*Стратегия\s*\d+:", b):
                 continue
-            if re.match(r"^[-*_]{2,}\s*$", s):
-                continue
-            keep.append(line)
-        return "\n".join(keep).strip()
+            opt = _extract_scores(b).get("Оптимальность", "0")
+            try:
+                opt_int = int(opt)
+            except ValueError:
+                opt_int = 0
+            strategy_blocks.append((opt_int, i, b))
 
-    for rank, (opt_int, i, b) in enumerate(strategy_blocks, 1):
-        title_line = b.splitlines()[0].strip()
-        title_rest = re.sub(r"^#+\s*", "", title_line).strip()
+        strategy_blocks.sort(key=lambda x: (-x[0], x[1]))
+        cup_chars = ("\U0001f947", "\U0001f948", "\U0001f949")
 
-        rank_badge = ""
-        if rank <= 3:
-            rank_badge = f'<span style="margin-right:8px;">{cup_chars[rank - 1]}</span>'
+        def _drop_ranking_block(text: str) -> str:
+            lines = text.splitlines()
+            keep = []
+            for line in lines:
+                s = line.strip()
+                if s.startswith("Ранжирование") or s.startswith("1\ufe0f\u20e3") or s.startswith("2\ufe0f\u20e3") or s.startswith("3\ufe0f\u20e3"):
+                    break
+                keep.append(line)
+            return "\n".join(keep).strip()
 
-        st.markdown(
-            f"""
-            <h3 style="display:flex;align-items:center;gap:6px;">
-                {rank_badge}
-                <span>{title_rest}</span>
-            </h3>
-            """,
-            unsafe_allow_html=True,
-        )
+        def _drop_scores_and_rules(text: str) -> str:
+            """Убирает строку с оценками (Оценки 0-10: ...) и горизонтальные разделители (---)."""
+            lines = text.splitlines()
+            keep = []
+            for line in lines:
+                s = line.strip()
+                if "Оценки" in s and ("Затратность" in s or "Оптимальность" in s or re.search(r"\d+\s*;\s*\d+", s)):
+                    continue
+                if re.match(r"^[-*_]{2,}\s*$", s):
+                    continue
+                keep.append(line)
+            return "\n".join(keep).strip()
 
-        scores = _extract_scores(b)
-        _render_pills(scores)
+        for rank, (opt_int, i, b) in enumerate(strategy_blocks, 1):
+            title_line = b.splitlines()[0].strip()
+            title_rest = re.sub(r"^#+\s*", "", title_line).strip()
 
-        b_no_scores = re.sub(r"^Оценки.*?$", "", b, flags=re.MULTILINE).strip()
-        desc_raw = "\n".join(b_no_scores.splitlines()[1:]).strip()
-        desc = _drop_ranking_block(desc_raw)
-        desc = _drop_scores_and_rules(desc)
-        if desc:
-            st.markdown(desc)
+            rank_badge = ""
+            if rank <= 3:
+                rank_badge = f'<span style="margin-right:8px;">{cup_chars[rank - 1]}</span>'
 
-        if "show_swot_map" not in st.session_state:
-            st.session_state["show_swot_map"] = {}
-        shown = bool(st.session_state["show_swot_map"].get(i, False))
-        btn = "Показать SWOT" if not shown else "Скрыть SWOT"
-        if st.button(btn, type="primary" if not shown else "secondary", key=f"swot_btn_{i}"):
-            st.session_state["show_swot_map"][i] = not shown
-            st.rerun()
+            st.markdown(
+                f"""
+                <h3 style="display:flex;align-items:center;gap:6px;">
+                    {rank_badge}
+                    <span>{title_rest}</span>
+                </h3>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        if st.session_state["show_swot_map"].get(i, False):
-            sw = swot_by_idx.get(i, {"S": [], "W": [], "O": [], "T": []})
-            _render_swot_table(sw)
+            scores = _extract_scores(b)
+            _render_pills(scores)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-else:
-    rag_summary = st.session_state.get("last_answer", "")
-    web_result = st.session_state.get("websearch_result")
-    future_result = st.session_state.get("future_result")
+            b_no_scores = re.sub(r"^Оценки.*?$", "", b, flags=re.MULTILINE).strip()
+            desc_raw = "\n".join(b_no_scores.splitlines()[1:]).strip()
+            desc = _drop_ranking_block(desc_raw)
+            desc = _drop_scores_and_rules(desc)
+            if desc:
+                st.markdown(desc)
 
-    # Если стратегии в процессе — покажем статус (без блокирующего ожидания)
-    if st.session_state.get("_pending_final_future"):
-        st.markdown(
-            '<div class="synergy-note">Формируем итоговые стратегии… Можно продолжать работать во вкладках — результат появится автоматически.</div>',
-            unsafe_allow_html=True,
-        )
-    elif st.session_state.get("final_unavailable"):
-        st.markdown(
-            '<div class="synergy-note">Итоговый стратег пока недоступен (не успел ответить за отведённое время). Попробуйте позже.</div>',
-            unsafe_allow_html=True,
-        )
+            if "show_swot_map" not in st.session_state:
+                st.session_state["show_swot_map"] = {}
+            shown = bool(st.session_state["show_swot_map"].get(i, False))
+            btn = "Показать SWOT" if not shown else "Скрыть SWOT"
+            if st.button(btn, type="primary" if not shown else "secondary", key=f"swot_btn_{i}"):
+                st.session_state["show_swot_map"][i] = not shown
+                st.rerun()
 
-# Вкладки для переключения между блоками анализа
+            if st.session_state["show_swot_map"].get(i, False):
+                sw = swot_by_idx.get(i, {"S": [], "W": [], "O": [], "T": []})
+                _render_swot_table(sw)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+# Если стратегий нет - просто ничего не показываем, вкладки будут ниже
+
+# Вкладки для переключения между блоками анализа (показываются всегда, но детали доступны после запуска)
 tab1, tab2, tab3 = st.tabs([
     "📚 Наш прошлый опыт",
     "🔍 Анализ конкурентов",
